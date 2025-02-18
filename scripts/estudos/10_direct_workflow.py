@@ -8,7 +8,6 @@ from collections.abc import Sequence
 
 from isaaclab_assets.robots.cartpole import CARTPOLE_CFG
 
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
@@ -70,7 +69,7 @@ class CartpoleEnv(DirectRLEnv):
         self.joint_vel = self.cartpole.data.joint_vel
 
     def _setup_scene(self):
-        ''' '''
+        ''' Configuração da Cena '''
 
         self.cartpole = Articulation(self.cfg.robot_cfg)
 
@@ -87,48 +86,123 @@ class CartpoleEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color = (0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        def _pre_physics_step(self, actions: torch.Tensor) -> None:
-            ''' '''
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        ''' '''
 
-            self.actions = self.action_scale * actions.clone()
+        self.actions = self.action_scale * actions.clone()
 
-        def _apply_action(self) -> None: 
-            ''' '''
-            self.cartpole.set_joint_effort_target(self.actions, joints_ids = self._cart_dof_idx)
+    def _apply_action(self) -> None: 
+        ''' '''
+        self.cartpole.set_joint_effort_target(self.actions, joint_ids = self._cart_dof_idx)
 
-        def _get_observations(self) -> dict: 
-            ''' '''
-            obs = torch.cat(
-                (
-                    self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                    self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                    self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                    self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                ),
-                dim=-1,
-            )
-            observations = {"policy", obs}
-            return observations
+    def _get_observations(self) -> dict: 
+        ''' '''
+        obs = torch.cat(
+            (
+                self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
+                self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
+                self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
+                self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
+            ),
+            dim=-1,
+        )
+        observations = {"policy": obs}
+        return observations
 
-        def _get_rewards(self) -> Torch.Tensor: 
-            ''' '''
-            total_rewards = compute_rewards(
-                self.cfg.rew_scale_alive,
-                self.cfg.rew_scale_terminated,
-                self.cfg.rew_scale_pole_pos,
-                self.cfg.rew_scale_cart_vel,
-                self.cfg.rew_scale_pole_vel,
-                self.joint_pos[:, self._pole_dof_idx[0]],
-                self.joint_vel[:, self._pole_dof_idx[0]],
-                self.joint_pos[:, self._cart_dof_idx[0]],
-                self.joint_vel[:, self._cart_dof_idx[0]],
-                self.reset_terminated,
-            )  
-            return total_rewards
-        
-        
-         
+    def _get_rewards(self) -> torch.Tensor: 
+        ''' '''
+        total_rewards = compute_rewards(
+            self.cfg.rew_scale_alive,
+            self.cfg.rew_scale_terminated,
+            self.cfg.rew_scale_pole_pos,
+            self.cfg.rew_scale_cart_vel,
+            self.cfg.rew_scale_pole_vel,
+            self.joint_pos[:, self._pole_dof_idx[0]],
+            self.joint_vel[:, self._pole_dof_idx[0]],
+            self.joint_pos[:, self._cart_dof_idx[0]],
+            self.joint_vel[:, self._cart_dof_idx[0]],
+            self.reset_terminated,
+        )  
+        return total_rewards
+    
+    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        ''' '''
 
+        self.joint_pos = self.cartpole.data.joint_pos
+        self.joint_vel = self.cartpole.data.joint_vel
+
+        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim = 1)
+        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
+
+        return out_of_bounds, time_out
+    
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        ''' '''
+
+        if env_ids is None:
+            env_ids = self.cartpole._ALL_INDICES
+        super()._reset_idx(env_ids)
+
+        joint_pos = self.cartpole.data.default_joint_pos[env_ids]
+
+        joint_pos[:, self._pole_dof_idx] += sample_uniform(
+            self.cfg.initial_pole_angle_range[0] * math.pi,
+            self.cfg.initial_pole_angle_range[1] * math.pi,
+            joint_pos[:, self._pole_dof_idx].shape,
+            joint_pos.device,
+        )
+
+        joint_vel = self.cartpole.data.default_joint_vel[env_ids]
+
+        default_root_state = self.cartpole.data.default_root_state[env_ids]
+        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+
+        self.joint_pos[env_ids] = joint_pos
+        self.joint_vel[env_ids] = joint_vel
+
+        self.cartpole.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.cartpole.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self.cartpole.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+
+
+
+@torch.jit.script
+def compute_rewards(
+    rew_scale_alive: float,       # Fator de escala para recompensa de sobrevivência
+    rew_scale_terminated: float,  # Fator de escala para penalização ao término do episódio
+    rew_scale_pole_pos: float,    # Fator de escala para penalização de posição do pêndulo
+    rew_scale_cart_vel: float,    # Fator de escala para penalização da velocidade do carrinho
+    rew_scale_pole_vel: float,    # Fator de escala para penalização da velocidade do pêndulo
+    pole_pos: torch.Tensor,       # Posição do pêndulo (tensor)
+    pole_vel: torch.Tensor,       # Velocidade do pêndulo (tensor)
+    cart_pos: torch.Tensor,       # Posição do carrinho (tensor) (não usado na recompensa)
+    cart_vel: torch.Tensor,       # Velocidade do carrinho (tensor)
+    reset_terminated: torch.Tensor # Indica se o episódio foi terminado (0 ou 1)
+    ) -> torch.Tensor:
+    
+    ''' Cálculo da recompensa total do agente '''
+
+    # Recompensa por permanecer ativo (1 se não terminou, 0 se terminou)
+    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
+
+    # Penalização quando o agente falha e o episódio termina
+    rew_termination = rew_scale_terminated * reset_terminated.float()
+
+    # Penalização pelo deslocamento do pêndulo (quanto mais longe do centro, maior a penalização)
+    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
+
+    # Penalização para velocidades altas do carrinho (valores absolutos somados)
+    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
+
+    # Penalização para velocidades altas do pêndulo (valores absolutos somados)
+    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
+
+    # Soma de todas as componentes da recompensa
+    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
+    
+    return total_reward
 
 
 
